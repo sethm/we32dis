@@ -9,7 +9,7 @@ it's Good Enough&trade; for some fairly basic usage.
 ## Usage
 
 ```
-we32dis [-n &lt;sec&gt;] -h|-i|-s|-d &lt;file&gt;
+we32dis [-n <sec>] -h|-i|-s|-d <file>
 
    -n            Target the named section (e.g. .text, .data)
    -h            Dump file header information
