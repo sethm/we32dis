@@ -6,6 +6,9 @@ use byteorder::{LittleEndian, ReadBytesExt};
 
 use crate::errors::DecodeError;
 use std::fmt;
+use std::collections::HashMap;
+use crate::coff::SymbolTableEntry;
+use crate::coff::RelocationEntry;
 
 const R_FP: usize = 9;
 const R_AP: usize = 10;
@@ -54,23 +57,25 @@ pub enum Data {
 }
 
 #[derive(Eq, PartialEq, Debug)]
-pub struct Operand {
-    mode: AddrMode,
-    data_type: Data,
-    expanded_type: Option<Data>,
-    register: Option<usize>,
-    embedded: u32,
-    bytes: Vec<u8>,
+pub struct Operand<'a> {
+    pub mode: AddrMode,
+    pub data_type: Data,
+    pub expanded_type: Option<Data>,
+    pub register: Option<usize>,
+    pub embedded: u32,
+    pub bytes: Vec<u8>,
+    pub mn: Option<&'static Mnemonic>,
+    pub relocation: Option<Relocation<'a>>,
 }
 
-impl Operand {
+impl<'a> Operand<'a> {
     fn new(
         mode: AddrMode,
         data_type: Data,
         expanded_type: Option<Data>,
         register: Option<usize>,
         embedded: u32,
-    ) -> Operand {
+    ) -> Operand<'a> {
         Operand {
             mode,
             data_type,
@@ -78,6 +83,8 @@ impl Operand {
             register,
             embedded,
             bytes: vec!(),
+            mn: None,
+            relocation: None,
         }
     }
 
@@ -96,10 +103,14 @@ impl Operand {
         self.bytes.push(((w >> 16) & 0xff) as u8);
         self.bytes.push(((w >> 24) & 0xff) as u8);
     }
+
+    fn data_type(&self) -> Data {
+        self.expanded_type.unwrap_or(self.data_type)
+    }
 }
 
 
-impl Default for Operand {
+impl<'a> Default for Operand<'a> {
     fn default() -> Self {
         Operand {
             mode: AddrMode::None,
@@ -107,12 +118,14 @@ impl Default for Operand {
             expanded_type: None,
             register: None,
             embedded: 0,
-            bytes: vec!()
+            bytes: vec!(),
+            mn: None,
+            relocation: None,
         }
     }
 }
 
-impl fmt::Display for Operand {
+impl<'a> fmt::Display for Operand<'a> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
 
         let reg_string = match self.register {
@@ -146,14 +159,22 @@ impl fmt::Display for Operand {
             AddrMode::WordDisplacementDeferred => write!(f, "*0x{:x}({})", self.embedded, reg_string)?,
             AddrMode::APShortOffset => write!(f, "{}(%ap)", self.embedded)?,
             AddrMode::FPShortOffset => write!(f, "{}(%fp)", self.embedded)?,
-            AddrMode::ByteImmediate => write!(f, "&{}", self.embedded)?,
+            AddrMode::ByteImmediate => write!(f, "&0x{:x}", self.embedded)?,
             AddrMode::HalfwordImmediate => write!(f, "&0x{:x}", self.embedded)?,
             AddrMode::WordImmediate => write!(f, "&0x{:x}", self.embedded)?,
             AddrMode::PositiveLiteral => write!(f, "&{}", self.embedded)?,
             AddrMode::NegativeLiteral => write!(f, "&{}", (self.embedded as u8) as i8)?,
             AddrMode::Register => write!(f, "{}", reg_string)?,
             AddrMode::RegisterDeferred => write!(f, "({})", reg_string)?,
-            AddrMode::None => write!(f, "{}", self.embedded)?,
+            AddrMode::None => {
+                let val = match self.data_type() {
+                    Data::Byte | Data::SByte => ((self.embedded as u8) as i8) as i32,
+                    Data::Half | Data::UHalf => ((self.embedded as u16) as i16) as i32,
+                    _ => self.embedded as i32
+                };
+                // The real 3B2 assembler prints negative hex values. But I hate that.
+                write!(f, "{}", val)?;
+            },
         }
 
         Ok(())
@@ -161,7 +182,7 @@ impl fmt::Display for Operand {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-struct Mnemonic {
+pub struct Mnemonic {
     opcode: u16,
     dtype: Data,
     name: &'static str,
@@ -169,17 +190,32 @@ struct Mnemonic {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-pub struct Instruction {
+pub struct Relocation<'a> {
+    pub symbol_table_entry: &'a SymbolTableEntry,
+    pub relocation_table_entry: &'a RelocationEntry,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub struct Instruction<'a> {
+    pub pc: u32,
     pub opcode: u16,
     pub name: &'static str,
     pub data_type: Data,
-    pub operands: Vec<Operand>,
+    pub operands: Vec<Operand<'a>>,
     pub bytes: Vec<u8>,
 }
 
-impl Default for Instruction {
+impl<'a> Instruction<'a> {
+    pub fn len(&self) -> usize {
+        let res: usize = self.operands.iter().map(|o| o.bytes.len()).sum();
+        self.bytes.len() + res
+    }
+}
+
+impl<'a> Default for Instruction<'a> {
     fn default() -> Self {
         Instruction {
+            pc: 0,
             opcode: 0,
             // The unwrap here is (relatively speaking) quite safe, since
             // we know the "halt" instruction is defined at offset 0.
@@ -191,8 +227,9 @@ impl Default for Instruction {
     }
 }
 
-impl fmt::Display for Instruction {
+impl<'a> fmt::Display for Instruction<'a> {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        write!(f, "{:08x}:  ", self.pc)?;
 
         let operands = &self.operands;
         let operand_bytes = &self.bytes;
@@ -218,8 +255,7 @@ impl fmt::Display for Instruction {
         }
 
         // Now compute how many spaces we need to write.
-
-        let spaces_needed: i32 = 30 - bytes_width;
+        let spaces_needed: i32 = 26 - bytes_width;
 
         if spaces_needed > 0 {
             for _ in 0..spaces_needed {
@@ -228,9 +264,9 @@ impl fmt::Display for Instruction {
         }
 
         // Now write the mnemonic
-        write!(f, " | {}", self.name)?;
+        write!(f, "{}", self.name)?;
 
-        let more_spaces: i32 = 10 - self.name.len() as i32;
+        let more_spaces: i32 = 8 - self.name.len() as i32;
 
         if more_spaces > 0 {
             for _ in 0..more_spaces {
@@ -238,8 +274,43 @@ impl fmt::Display for Instruction {
             }
         }
 
-        // Finally, write the operands
-        write!(f, "{}", operands.into_iter().map(|op| format!("{}", op)).collect::<Vec<String>>().join(","))?;
+        let mut last_etype_format: Option<&str> = None;
+
+        // Write the operands
+        write!(f, "{}", operands.into_iter().map( |op| {
+            let etype_format = match op.expanded_type {
+                Some(Data::Byte) => Some("{ubyte}"),
+                Some(Data::Half) => Some("{shalf}"),
+                Some(Data::Word) => Some("{sword}"),
+                Some(Data::SByte) => Some("{sbyte}"),
+                Some(Data::UHalf) => Some("{uhalf}"),
+                Some(Data::UWord) => Some("{uword}"),
+                _ => None
+            };
+
+            if last_etype_format != etype_format {
+                last_etype_format = etype_format;
+                format!("{}{}", etype_format.unwrap_or(""), op)
+            } else {
+                format!("{}", op)
+            }
+        }).collect::<Vec<String>>().join(","))?;
+
+        // If the instruction was a jump, we want to compute the new address
+        // if possible.
+        let offset: Option<i32> = match self.opcode {
+            0x4A | 0x6E | 0x7E => {
+                Some(((self.operands.last().unwrap().embedded as u16) as i16) as i32)
+            },
+            0x4B | 0x6F | 0x7F => {
+                Some(((self.operands.last().unwrap().embedded as u8) as i8) as i32)
+            },
+            _ => None
+        };
+
+        if offset.is_some() {
+            write!(f, " <0x{:08x}>", (self.pc as i32 + offset.unwrap()))?;
+        }
 
         return Ok(())
     }
@@ -533,13 +604,55 @@ static HALFWORD_MNEMONICS: [Option<Mnemonic>; HALFWORD_MNEMONIC_COUNT] = [
 static NULL_MNEMONIC: Option<Mnemonic> = None;
 
 pub struct Decoder<'a> {
+    pc: u32,
+    address: u32,
     cursor: Cursor<&'a Vec<u8>>,
+    relocation_table: HashMap<u32, &'a RelocationEntry>,
+    symbol_table: HashMap<usize, &'a SymbolTableEntry>,
 }
 
 impl<'a> Decoder<'a> {
-    pub fn new(data: &'a Vec<u8>) -> Self {
+    pub fn new(data: &'a Vec<u8>, pc: u32,
+               symbol_table: &'a Vec<SymbolTableEntry>,
+               relocation_table: &'a Vec<RelocationEntry>) -> Self {
+        let mut relocation_hash: HashMap<u32, &'a RelocationEntry> = HashMap::new();
+        for entry in relocation_table {
+            relocation_hash.insert(entry.vaddr, &entry);
+        }
+
+        let mut index: usize = 0;
+        let mut symbol_hash: HashMap<usize, &'a SymbolTableEntry> = HashMap::new();
+        for entry in symbol_table {
+            symbol_hash.insert(index, &entry);
+            index += 1;
+            for _ in 0..entry.aux.len() {
+                symbol_hash.insert(index, &entry);
+                index += 1;
+            }
+        }
+
         Decoder {
+            pc,
+            address: pc,
             cursor: Cursor::new(data),
+            symbol_table: symbol_hash,
+            relocation_table: relocation_hash,
+        }
+    }
+
+    fn get_relocation(&self) -> Option<Relocation<'a>> {
+        if let Some(relocation_table_entry) = self.relocation_table.get(&self.address) {
+            if let Some(symbol_table_entry) = self.symbol_table.get(&(relocation_table_entry.symndx as usize)) {
+                let reloc = Relocation {
+                    symbol_table_entry,
+                    relocation_table_entry,
+                };
+                Some(reloc)
+            } else {
+                None
+            }
+        } else {
+            None
         }
     }
 
@@ -547,24 +660,36 @@ impl<'a> Decoder<'a> {
     ///
     /// These operands belong to only certain instructions, where a word without
     /// a descriptor byte immediately follows the opcode.
-    fn decode_literal_operand(&mut self, mn: &Mnemonic) -> Result<Operand, DecodeError> {
+    fn decode_literal_operand(&mut self, mn: &Mnemonic) -> Result<Operand<'a>, DecodeError> {
         match mn.dtype {
             Data::Byte => {
                 let b: u8 = self.cursor.read_u8()?;
                 let mut op = Operand::new(AddrMode::None, Data::Byte, None, None, u32::from(b));
                 op.append_u8(b);
+                if op.relocation.is_none() {
+                    op.relocation = self.get_relocation();
+                }
+                self.address += 1;
                 Ok(op)
             }
             Data::Half => {
                 let h: u16 = self.cursor.read_u16::<LittleEndian>()?;
                 let mut op = Operand::new(AddrMode::None, Data::Half, None, None, u32::from(h));
                 op.append_u16(h);
+                if op.relocation.is_none() {
+                    op.relocation = self.get_relocation();
+                }
+                self.address += 2;
                 Ok(op)
             }
             Data::Word => {
                 let w: u32 = self.cursor.read_u32::<LittleEndian>()?;
                 let mut op = Operand::new(AddrMode::None, Data::Half, None, None, u32::from(w));
                 op.append_u32(w);
+                if op.relocation.is_none() {
+                    op.relocation = self.get_relocation();
+                }
+                self.address += 4;
                 Ok(op)
             },
             _ => Err(DecodeError::Parse),
@@ -574,17 +699,22 @@ impl<'a> Decoder<'a> {
     /// Decode a descriptor Operand type.
     fn decode_descriptor_operand(
         &mut self,
-        dtype: Data,
+        mn: &'static Mnemonic,
         etype: Option<Data>,
-    ) -> Result<Operand, DecodeError> {
+    ) -> Result<Operand<'a>, DecodeError> {
         let mut op = Operand::default();
 
-        op.data_type = dtype;
+        op.data_type = mn.dtype;
         op.expanded_type = etype;
+        op.mn = Some(&mn);
 
         let descriptor_byte: u8 = self.cursor.read_u8()?;
-
+        self.address += 1;
         op.append_u8(descriptor_byte);
+
+        if op.relocation.is_none() {
+            op.relocation = self.get_relocation();
+        }
 
         let m = (descriptor_byte & 0xf0) >> 4;
         let r = descriptor_byte & 0xf;
@@ -751,12 +881,37 @@ impl<'a> Decoder<'a> {
                 }
             }
             14 => match r {
-                0 => return self.decode_descriptor_operand(dtype, Some(Data::UWord)),
-                2 => return self.decode_descriptor_operand(dtype, Some(Data::UHalf)),
-                3 => return self.decode_descriptor_operand(dtype, Some(Data::Byte)),
-                4 => return self.decode_descriptor_operand(dtype, Some(Data::Word)),
-                6 => return self.decode_descriptor_operand(dtype, Some(Data::Half)),
-                7 => return self.decode_descriptor_operand(dtype, Some(Data::SByte)),
+                // Expanded type handling
+                0 => {
+                    let mut expanded_op = self.decode_descriptor_operand(mn, Some(Data::UWord))?;
+                    expanded_op.bytes.insert(0, descriptor_byte);
+                    return Ok(expanded_op)
+                },
+                2 => {
+                    let mut expanded_op = self.decode_descriptor_operand(mn, Some(Data::UHalf))?;
+                    expanded_op.bytes.insert(0, descriptor_byte);
+                    return Ok(expanded_op)
+                },
+                3 => {
+                    let mut expanded_op = self.decode_descriptor_operand(mn, Some(Data::Byte))?;
+                    expanded_op.bytes.insert(0, descriptor_byte);
+                    return Ok(expanded_op)
+                },
+                4 => {
+                    let mut expanded_op = self.decode_descriptor_operand(mn, Some(Data::Word))?;
+                    expanded_op.bytes.insert(0, descriptor_byte);
+                    return Ok(expanded_op)
+                },
+                6 => {
+                    let mut expanded_op = self.decode_descriptor_operand(mn, Some(Data::Half))?;
+                    expanded_op.bytes.insert(0, descriptor_byte);
+                    return Ok(expanded_op)
+                },
+                7 => {
+                    let mut expanded_op = self.decode_descriptor_operand(mn, Some(Data::SByte))?;
+                    expanded_op.bytes.insert(0, descriptor_byte);
+                    return Ok(expanded_op)
+                },
                 15 => {
                     let w = self.cursor.read_u32::<LittleEndian>()?;
                     op.mode = AddrMode::AbsoluteDeferred;
@@ -775,25 +930,29 @@ impl<'a> Decoder<'a> {
             _ => { return Err(DecodeError::Parse); }
         };
 
+        self.address += op.bytes.len() as u32 - 1;
+
         Ok(op)
     }
 
     /// Fully decode an Operand
     fn decode_operand(
         &mut self,
-        mn: &Mnemonic,
+        mn: &'static Mnemonic,
         ot: OpType,
         etype: Option<Data>,
-    ) -> Result<Operand, DecodeError> {
+    ) -> Result<Operand<'a>, DecodeError> {
         match ot {
             OpType::Lit => self.decode_literal_operand(mn),
-            OpType::Src | OpType::Dest => self.decode_descriptor_operand(mn.dtype, etype),
+            OpType::Src | OpType::Dest => self.decode_descriptor_operand(mn, etype),
             OpType::None => Err(DecodeError::Parse),
         }
     }
 
     /// Decode the instruction currently pointed at by the cursor.
-    fn decode_instruction(&mut self) -> Result<Instruction, DecodeError> {
+    fn decode_instruction(&mut self) -> Result<Instruction<'a>, DecodeError> {
+        self.address = self.pc + 1;
+
         // Read the first byte of the instruction. Most instructions are only
         // one byte, so this is usually enough.
         let b1 = self.cursor.read_u8()?;
@@ -841,11 +1000,14 @@ impl<'a> Decoder<'a> {
                     instruction.operands.push(op);
                 }
 
+                instruction.pc = self.pc;
                 instruction.opcode = mn.opcode;
                 instruction.name = mn.name;
                 instruction.data_type = mn.dtype;
+                self.pc += instruction.len() as u32;
             }
             None => {
+                self.pc += 1;
             }
         }
 
@@ -854,9 +1016,9 @@ impl<'a> Decoder<'a> {
 }
 
 impl<'a> Iterator for Decoder<'a> {
-    type Item = Instruction;
+    type Item = Instruction<'a>;
 
-    fn next(&mut self) -> Option<Instruction> {
+    fn next(&mut self) -> Option<Instruction<'a>> {
         if let Ok(instruction) = self.decode_instruction() {
             Some(instruction)
         } else {

@@ -1,22 +1,19 @@
+use std::collections::HashMap;
+use std::fmt;
+use std::io;
+use std::io::{Read, Seek, SeekFrom};
+use std::io::Cursor;
+use std::str;
 ///
 /// WE32000 COFF File Parsing and Utilities
 ///
 
-use std::str::Utf8Error;
-use std::fmt;
-use std::io::Cursor;
-use std::io;
-use std::io::{Read, Seek, SeekFrom};
-use std::str;
-
-use crate::errors::{CoffError, ReadResult, OffsetError};
-
+use byteorder::{BigEndian, ReadBytesExt};
 use chrono::prelude::*;
 use chrono::TimeZone;
 
-use byteorder::{BigEndian, ReadBytesExt};
-use std::collections::HashMap;
 use crate::decoder::Decoder;
+use crate::errors::{CoffError, OffsetError, ReadResult};
 
 // WE32000 without transfer vector
 const MAGIC_WE32K: u16 = 0x170;
@@ -249,13 +246,20 @@ impl fmt::Debug for SectionHeader {
 }
 
 /// Representation of a Relocation Table Entry
+#[derive(Eq, PartialEq)]
 pub struct RelocationEntry {
     pub vaddr: u32,
     pub symndx: u32,
     pub rtype: u16,
 }
 
-#[derive(Copy, Clone)]
+impl fmt::Debug for RelocationEntry {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "[vaddr=0x{:08x} symndx={}, rtype={}]", self.vaddr, self.symndx, self.rtype)
+    }
+}
+
+#[derive(Eq, PartialEq, Copy, Clone)]
 pub enum StorageClass {
     EndOfFunction,
     Null,
@@ -320,171 +324,144 @@ impl fmt::Debug for StorageClass {
     }
 }
 
-/// Representation of a Symbol Table Entry
-pub enum Symbol {
-    Primary {
-        // Primary Symbol Data
-        //
-        //   8 bytes: _n {
-        //       8 bytes: n_name
-        //   } OR {
-        //       4 bytes: n_zeroes
-        //       4 bytes: n_offset
-        //   } OR {
-        //       4 bytes: n_nptr[0]
-        //       4 bytes: n_nptr[1]
-        //   }
-        //   4 bytes: n_value
-        //   2 bytes: n_scnum
-        //   2 bytes: n_type
-        //   1 byte:  n_sclass
-        //   1 byte:  n_numaux
-        //   ------------------
-        //   18 bytes total
-        n_name: [u8; SYM_NAME_LEN],
-        n_zeroes: u32, // may also be n_nptr[0] for overlaying
-        n_offset: u32, // may also be n_nptr[1] for overlaying
-        n_value: u32,
-        n_scnum: i16,
-        n_type: u16,
-        n_numaux: u8,
-        storage_class: StorageClass,
-    },
-    Auxiliary {
-        // Auxiliary Symbol Data
-        //
-        //   This is a huge mess because of all the unioning going on. We
-        //   just need to deal with it and destrcture the data.
-        //
-        //   4 bytes: x_tagndx
-        //   4 bytes: x_misc {
-        //       2 bytes: x_lnno
-        //       2 bytes: x_size
-        //   } OR {
-        //       4 bytes: x_fsize
-        //   }
-        //   8 bytes: x_fcnary {
-        //       4 bytes: x_lnnoptr
-        //       4 bytes: x_endndx
-        //   } OR {
-        //       8 bytes: x_dimen[u16; 4]
-        //   }
-        //   2 bytes: x_tvndx
-        //   ------------------
-        //   18 bytes total
-        x_fname: Option<String>,
-        x_tagndx: u32,
-        x_lnno: u16,        // Decl. line number
-        x_size: u16,        // Str, union, array size
-        x_fsize: u32,       // Size of function
-        x_lnnoptr: u32,     // Ptr to fcn line #
-        x_endndx: u32,      // Entry ndx past block end
-        x_dimen: [u16; 4],  // Up to 4 array dimen.
-        x_tvndx: u16,       // TV index
-    }
+#[derive(Debug, Eq, PartialEq)]
+pub struct PrimarySymbol {
+    pub n_name: [u8; SYM_NAME_LEN],
+    pub n_zeroes: u32, // may also be n_nptr[0] for overlaying
+    pub n_offset: u32, // may also be n_nptr[1] for overlaying
+    pub n_value: u32,
+    pub n_scnum: i16,
+    pub n_type: u16,
+    pub n_numaux: u8,
+    pub storage_class: StorageClass,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub struct AuxiliarySymbol {
+    pub x_fname: Option<String>,
+    pub x_tagndx: u32,
+    pub x_lnno: u16,        // Decl. line number
+    pub x_size: u16,        // Str, union, array size
+    pub x_fsize: u32,       // Size of function
+    pub x_lnnoptr: u32,     // Ptr to fcn line #
+    pub x_endndx: u32,      // Entry ndx past block end
+    pub x_dimen: [u16; 4],  // Up to 4 array dimen.
+    pub x_tvndx: u16,       // TV index
+}
+
+#[derive(Debug, Eq, PartialEq)]
 pub struct SymbolTableEntry {
-    symbol: Symbol,
+    pub primary: PrimarySymbol,
+    pub aux: Vec<AuxiliarySymbol>,
 }
 
+///
+/// A symbol table entry is a collection of entries, all related to a primary entry.
+///
 impl SymbolTableEntry {
-    pub fn read_symbol(cursor: &mut Cursor<&[u8]>, is_aux: bool, parent_class: &StorageClass) -> io::Result<Symbol> {
+    pub fn len(&self) -> usize {
+        1 + self.aux.len()
+    }
+
+    pub fn read_entry(cursor: &mut Cursor<&[u8]>) -> io::Result<SymbolTableEntry> {
         let mut raw_data: [u8; 18] = [0; 18];
 
-        // Consume 18 bytes.
         cursor.read_exact(&mut raw_data)?;
 
-        let symbol = match is_aux {
-            true => {
-                let mut x_dimen: [u16; 4] = Default::default();
+        let mut n_name: [u8; SYM_NAME_LEN] = Default::default();
+        n_name.copy_from_slice(&raw_data[0..8]);
+        let n_zeroes = (&raw_data[0..4]).read_u32::<BigEndian>()?;
+        let n_offset = (&raw_data[4..8]).read_u32::<BigEndian>()?;
+        let n_value = (&raw_data[8..12]).read_u32::<BigEndian>()?;
+        let n_scnum = (&raw_data[12..14]).read_i16::<BigEndian>()?;
+        let n_type = (&raw_data[14..16]).read_u16::<BigEndian>()?;
+        let n_sclass = raw_data[16] as i8;
+        let n_numaux = raw_data[17];
 
-                let x_fname = match parent_class {
-                    StorageClass::Filename => {
-                        Some(buf_to_str(&raw_data[0..14]).unwrap_or("???").to_owned())
-                    },
-                    _ => None
-                };
-
-                let x_tagndx = (&raw_data[0..4]).read_u32::<BigEndian>()?;
-                let x_lnno = (&raw_data[4..6]).read_u16::<BigEndian>()?;
-                let x_size = (&raw_data[6..8]).read_u16::<BigEndian>()?;
-                let x_fsize = (&raw_data[4..8]).read_u32::<BigEndian>()?;
-                let x_lnnoptr = (&raw_data[8..12]).read_u32::<BigEndian>()?;
-                let x_endndx = (&raw_data[12..16]).read_u32::<BigEndian>()?;
-                x_dimen[0] = (&raw_data[8..10]).read_u16::<BigEndian>()?;
-                x_dimen[1] = (&raw_data[10..12]).read_u16::<BigEndian>()?;
-                x_dimen[2] = (&raw_data[12..14]).read_u16::<BigEndian>()?;
-                x_dimen[3] = (&raw_data[14..16]).read_u16::<BigEndian>()?;
-                let x_tvndx = (&raw_data[16..18]).read_u16::<BigEndian>()?;
-
-                Symbol::Auxiliary {
-                    x_fname,
-                    x_tagndx,
-                    x_lnno,
-                    x_size,
-                    x_fsize,
-                    x_lnnoptr,
-                    x_endndx,
-                    x_dimen,
-                    x_tvndx,
-                }
-            },
-            false => {
-                let mut n_name: [u8; SYM_NAME_LEN] = Default::default();
-                n_name.copy_from_slice(&raw_data[0..8]);
-                let n_zeroes = (&raw_data[0..4]).read_u32::<BigEndian>()?;
-                let n_offset = (&raw_data[4..8]).read_u32::<BigEndian>()?;
-                let n_value = (&raw_data[8..12]).read_u32::<BigEndian>()?;
-                let n_scnum = (&raw_data[12..14]).read_i16::<BigEndian>()?;
-                let n_type = (&raw_data[14..16]).read_u16::<BigEndian>()?;
-                let n_sclass = raw_data[16] as i8;
-                let n_numaux = raw_data[17];
-
-                let storage_class = match n_sclass {
-                    -1 => StorageClass::EndOfFunction,
-                    1 => StorageClass::Auto,
-                    2 => StorageClass::ExternalSym,
-                    3 => StorageClass::Static,
-                    4 => StorageClass::Register,
-                    5 => StorageClass::ExternalDef,
-                    6 => StorageClass::Label,
-                    7 => StorageClass::UndefinedLabel,
-                    8 => StorageClass::MemberOfStruct,
-                    9 => StorageClass::FunctionArg,
-                    10 => StorageClass::StructureTag,
-                    11 => StorageClass::MemberOfUnion,
-                    12 => StorageClass::UnionTag,
-                    13 => StorageClass::TypeDefinition,
-                    14 => StorageClass::UninitializedStatic,
-                    15 => StorageClass::EnumerationTag,
-                    16 => StorageClass::MemberOfEnumeration,
-                    17 => StorageClass::RegisterParameter,
-                    18 => StorageClass::BitField,
-                    100 => StorageClass::BeginEndBlock,
-                    101 => StorageClass::BeginEndFunc,
-                    102 => StorageClass::EndOfStruct,
-                    103 => StorageClass::Filename,
-                    104 => StorageClass::Line,
-                    105 => StorageClass::Alias,
-                    106 => StorageClass::Hidden,
-                    _ => StorageClass::Null,
-                };
-
-                Symbol::Primary {
-                    n_name,
-                    n_zeroes,
-                    n_offset,
-                    n_value,
-                    n_scnum,
-                    n_type,
-                    n_numaux,
-                    storage_class,
-                }
-            },
+        let storage_class = match n_sclass {
+            -1 => StorageClass::EndOfFunction,
+            1 => StorageClass::Auto,
+            2 => StorageClass::ExternalSym,
+            3 => StorageClass::Static,
+            4 => StorageClass::Register,
+            5 => StorageClass::ExternalDef,
+            6 => StorageClass::Label,
+            7 => StorageClass::UndefinedLabel,
+            8 => StorageClass::MemberOfStruct,
+            9 => StorageClass::FunctionArg,
+            10 => StorageClass::StructureTag,
+            11 => StorageClass::MemberOfUnion,
+            12 => StorageClass::UnionTag,
+            13 => StorageClass::TypeDefinition,
+            14 => StorageClass::UninitializedStatic,
+            15 => StorageClass::EnumerationTag,
+            16 => StorageClass::MemberOfEnumeration,
+            17 => StorageClass::RegisterParameter,
+            18 => StorageClass::BitField,
+            100 => StorageClass::BeginEndBlock,
+            101 => StorageClass::BeginEndFunc,
+            102 => StorageClass::EndOfStruct,
+            103 => StorageClass::Filename,
+            104 => StorageClass::Line,
+            105 => StorageClass::Alias,
+            106 => StorageClass::Hidden,
+            _ => StorageClass::Null,
         };
 
-        Ok(symbol)
+        let primary = PrimarySymbol {
+            n_name,
+            n_zeroes,
+            n_offset,
+            n_value,
+            n_scnum,
+            n_type,
+            n_numaux,
+            storage_class,
+        };
+
+        let mut aux = Vec::new();
+
+        for _ in 0..n_numaux {
+            cursor.read_exact(&mut raw_data)?;
+
+            let mut x_dimen: [u16; 4] = Default::default();
+
+            let x_fname = match storage_class {
+                StorageClass::Filename => {
+                    Some(buf_to_str(&raw_data[0..14]).unwrap_or("???").to_owned())
+                },
+                _ => None
+            };
+
+            let x_tagndx = (&raw_data[0..4]).read_u32::<BigEndian>()?;
+            let x_lnno = (&raw_data[4..6]).read_u16::<BigEndian>()?;
+            let x_size = (&raw_data[6..8]).read_u16::<BigEndian>()?;
+            let x_fsize = (&raw_data[4..8]).read_u32::<BigEndian>()?;
+            let x_lnnoptr = (&raw_data[8..12]).read_u32::<BigEndian>()?;
+            let x_endndx = (&raw_data[12..16]).read_u32::<BigEndian>()?;
+            x_dimen[0] = (&raw_data[8..10]).read_u16::<BigEndian>()?;
+            x_dimen[1] = (&raw_data[10..12]).read_u16::<BigEndian>()?;
+            x_dimen[2] = (&raw_data[12..14]).read_u16::<BigEndian>()?;
+            x_dimen[3] = (&raw_data[14..16]).read_u16::<BigEndian>()?;
+            let x_tvndx = (&raw_data[16..18]).read_u16::<BigEndian>()?;
+
+            aux.push(AuxiliarySymbol {
+                x_fname,
+                x_tagndx,
+                x_lnno,
+                x_size,
+                x_fsize,
+                x_lnnoptr,
+                x_endndx,
+                x_dimen,
+                x_tvndx,
+            });
+        }
+
+        Ok(SymbolTableEntry {
+            primary,
+            aux,
+        })
     }
 }
 
@@ -532,20 +509,8 @@ impl StringTable {
         Ok(table)
     }
 
-    pub fn string_at(&self, index: u32) -> Result<&str, Utf8Error> {
-        let start = index as usize;
-
-        // Index into the vector at the appropriate location, and then
-        // find the first nul.
-        let nul = self.data[start.. ].iter()
-            .position( |&c| c == b'\0')
-            .unwrap_or(self.data.len() - start);
-
-        let end = start + nul;
-
-        let s = &self.data[start..end];
-
-        str::from_utf8(&s)
+    pub fn string_at(&self, index: u32) -> Option<String> {
+        self.strings.get(&index).cloned()
     }
 }
 
@@ -631,42 +596,12 @@ impl FileContainer {
         if header.symbol_count > 0 {
             cursor.seek(SeekFrom::Start(u64::from(header.symbol_table_offset)))?;
 
-            // Keep track of which symbols are aux symbols.
-            let mut is_aux = false;
-            let mut aux_index: u8 = 0;
-            let mut sclass: StorageClass = StorageClass::Null;
+            let mut index: usize = 0;
 
-            for _ in 0..header.symbol_count {
-                let symbol = SymbolTableEntry::read_symbol(cursor, is_aux, &sclass)?;
-
-                if is_aux {
-                    aux_index -= 1;
-                    if aux_index == 0 {
-                        is_aux = false;
-                    }
-                }
-
-                match symbol {
-                    Symbol::Primary {
-                        n_name: _,
-                        n_zeroes: _,
-                        n_offset: _,
-                        n_value: _,
-                        n_scnum: _,
-                        n_type: _,
-                        n_numaux,
-                        storage_class,
-                    } => {
-                        if n_numaux > 0 {
-                            is_aux = true;
-                            aux_index = n_numaux;
-                            sclass = storage_class;
-                        }
-                    },
-                    _ => {}
-                }
-
-                symbols.push(SymbolTableEntry { symbol });
+            while index < header.symbol_count as usize {
+                let entry: SymbolTableEntry = SymbolTableEntry::read_entry(cursor)?;
+                index += entry.len();
+                symbols.push(entry);
             }
         }
 
@@ -850,76 +785,61 @@ impl FileContainer {
     pub fn dump_symbol_table(&self) {
         println!("Symbol Table:");
 
-        if self.symbols.is_empty() {
+        let symbols = &self.symbols;
+
+        if symbols.is_empty() {
             println!("    No Entries");
             return;
         }
 
+        let mut index = 0;
+
         println!("[");
 
-        for (i, e) in self.symbols.iter().enumerate() {
-            let symbol = &e.symbol;
+        for entry in symbols {
 
-            match symbol {
-                Symbol::Primary {
-                    n_name,
-                    n_zeroes,
-                    n_offset,
-                    n_value,
-                    n_scnum,
-                    n_type,
-                    n_numaux,
-                    storage_class,
-                } => {
-                    let name = if *n_zeroes == 0 {
-                        self.strings.string_at(*n_offset).unwrap_or("???")
-                    } else {
-                        buf_to_str(n_name).unwrap_or("???")
-                    };
+            let primary = &entry.primary;
+            let aux = &entry.aux;
 
-                    println!("    {{");
-                    println!("        index: {},", i);
-                    println!("        name: '{}',", name);
-                    println!("        value: '0x{:x}',", n_value);
-                    println!("        section: {},", n_scnum);
-                    println!("        type: '0x{:02x}',", n_type);
-                    println!("        class: '{:?}',", storage_class);
-                    println!("        numaux: {}", n_numaux);
-
-                },
-                Symbol::Auxiliary {
-                    x_fname,
-                    x_tagndx,
-                    x_lnno,
-                    x_size,
-                    x_fsize,
-                    x_lnnoptr,
-                    x_endndx,
-                    x_dimen,
-                    x_tvndx,
-                } => {
-                    println!("    {{");
-                    println!("        index: {},", i);
-                    if x_fname.is_some() {
-                        println!("        filename: '{}',", x_fname.as_ref().unwrap());
-                    } else {
-                        println!("        tagindex: {},", x_tagndx);
-                        println!("        lnno: '0x{:x}',", x_lnno);
-                        println!("        size: '0x{:x}',", x_size);
-                        println!("        fsize: '0x{:x}',", x_fsize);
-                    }
-                    println!("        lnnoptr: '0x{:x}',", x_lnnoptr);
-                    println!("        endndx: {},", x_endndx);
-                    println!("        dim0: {},", x_dimen[0]);
-                    println!("        dim1: {},", x_dimen[1]);
-                    println!("        tvndx: {}", x_tvndx);
-                }
-            }
-
-            if i < self.symbols.len() - 1 {
-                println!("    }},")
+            let name = if primary.n_zeroes == 0 {
+                self.strings.string_at(primary.n_offset).unwrap_or("???".to_owned())
             } else {
-                println!("    }}");
+                buf_to_str(&primary.n_name).unwrap_or("???").to_owned()
+            };
+
+            println!("    {{");
+            println!("        index: {},", index);
+            println!("        name: '{}',", name);
+            println!("        value: '0x{:x}',", primary.n_value);
+            println!("        section: {},", primary.n_scnum);
+            println!("        type: '0x{:02x}',", primary.n_type);
+            println!("        class: '{:?}',", primary.storage_class);
+            println!("        numaux: {}", primary.n_numaux);
+            println!("    }},");
+
+            index += 1;
+
+            if !aux.is_empty() {
+                for aux_sym in aux {
+                    println!("    {{");
+                    println!("        index: {},", index);
+                    if aux_sym.x_fname.is_some() {
+                        println!("        filename: '{}',", aux_sym.x_fname.as_ref().unwrap());
+                    } else {
+                        println!("        tagindex: {},", aux_sym.x_tagndx);
+                        println!("        lnno: '0x{:x}',", aux_sym.x_lnno);
+                        println!("        size: '0x{:x}',", aux_sym.x_size);
+                        println!("        fsize: '0x{:x}',", aux_sym.x_fsize);
+                    }
+                    println!("        lnnoptr: '0x{:x}',", aux_sym.x_lnnoptr);
+                    println!("        endndx: {},", aux_sym.x_endndx);
+                    println!("        dim0: {},", aux_sym.x_dimen[0]);
+                    println!("        dim1: {},", aux_sym.x_dimen[1]);
+                    println!("        tvndx: {}", aux_sym.x_tvndx);
+                    println!("    }},");
+
+                    index += 1;
+                }
             }
         }
 
@@ -946,13 +866,83 @@ impl FileContainer {
         }
     }
 
+
+    fn symbol_name(&self, primary: &PrimarySymbol) -> String {
+        if primary.n_zeroes == 0 {
+            self.strings.string_at(primary.n_offset).unwrap_or("???".to_owned())
+        } else {
+            buf_to_str(&primary.n_name).unwrap_or("???").to_owned()
+        }
+    }
+
+    fn func_symbol(&self, pc: u32) -> Option<&SymbolTableEntry> {
+        for entry in &self.symbols {
+            match entry.primary.storage_class {
+                StorageClass::ExternalSym => {
+                    if entry.primary.n_value == pc {
+                        return Some(&entry)
+                    }
+                },
+                _ => {}
+            }
+        }
+
+        None
+    }
+
     pub fn disassemble_named_section(&self, name: &str) {
         for section in &self.sections {
             if section.name == name {
-                let decoder = Decoder::new(&section.data);
+                println!("section {}", name);
+                let pc = section.header.vaddr;
+                let decoder = Decoder::new(&section.data, pc, &self.symbols, &section.relocation_table);
 
                 for instruction in decoder {
-                    println!("{}", instruction);
+                    if let Some(e) = self.func_symbol(instruction.pc) {
+                        println!("{}()", self.symbol_name(&e.primary))
+                    }
+                    print!("        {}", instruction);
+                    for (i, op) in instruction.operands.iter().enumerate() {
+                        if let Some(reloc) = &op.relocation {
+                            let primary = &reloc.symbol_table_entry.primary;
+                            let symbol_name = self.symbol_name(primary);
+                            print!(" [{}={}", i, symbol_name);
+                            match primary.storage_class {
+                                StorageClass::ExternalSym => {
+                                    if primary.n_type == 0x24 {
+                                        print!("()")
+                                    }
+                                },
+                                StorageClass::Static => {
+                                    if let Some(aux) = &reloc.symbol_table_entry.aux.get(0) {
+                                        if let Some(s) = self.strings.strings.get(&aux.x_tagndx) {
+                                            print!(" <{}>", s);
+                                        } else {
+                                            if let Some(static_data) = self.symbols
+                                                .iter()
+                                                .find(|s| s.primary.n_value == op.embedded) {
+                                                let name = self.symbol_name(&static_data.primary);
+                                                print!(" <{}>", name);
+                                            } else {
+                                                // Is this a string in the data table?
+                                                if symbol_name == ".data" {
+                                                    if let Some(data_section) = self.sections.iter().find(|s| s.name == ".data") {
+                                                        let offset = op.embedded as usize - data_section.header.vaddr as usize;
+                                                        if let Ok(s) = buf_to_str(&data_section.data[offset..]) {
+                                                            print!(" <'{}'>", s);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                            print!("]");
+                        }
+                    }
+                    println!();
                 }
             }
         }

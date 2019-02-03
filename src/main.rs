@@ -17,7 +17,8 @@ mod decoder;
 
 enum FileAction {
     Header,
-    Extract,
+    Info,
+    Symbols,
     Disassemble,
 }
 
@@ -32,7 +33,7 @@ fn handle_file_buffer(buf: &[u8], action: FileAction, section: Option<&str>) {
                         println!("{:?}", opt_header);
                     }
                 },
-                FileAction::Extract => {
+                FileAction::Info => {
                     for (sec_num, section) in container.sections.iter().enumerate() {
                         println!("{:?}", section.header);
 
@@ -44,11 +45,12 @@ fn handle_file_buffer(buf: &[u8], action: FileAction, section: Option<&str>) {
                             println!("Error: Couldn't dump section data: {:?}", e);
                         }
                     }
-                    container.dump_symbol_table();
                     container.dump_strings_table();
                 },
+                FileAction::Symbols => {
+                    container.dump_symbol_table();
+                },
                 FileAction::Disassemble => {
-                    print!("Using section: {}\n\n", section.unwrap_or(".text"));
                     container.disassemble_named_section(section.unwrap_or(".text"));
                 }
             }
@@ -80,6 +82,11 @@ fn main() {
             .long("info")
             .help("Extract section information")
             .group("action"))
+        .arg(Arg::with_name("symbols")
+            .short("t")
+            .long("symbol-table")
+            .help("Dump symbol table")
+            .group("action"))
         .arg(Arg::with_name("disassemble")
             .short("d")
             .long("disassemble")
@@ -95,14 +102,16 @@ fn main() {
 
     let infile = matches.value_of("INPUT").unwrap_or("a.out");
     let section = matches.value_of("SECTION");
-    let (header, extract, disassemble) = (matches.is_present("header"),
-                                          matches.is_present("extract"),
-                                          matches.is_present("disassemble"));
+    let (header, info, symbols, disassemble) = (matches.is_present("header"),
+                                                matches.is_present("info"),
+                                                matches.is_present("symbols"),
+                                                matches.is_present("disassemble"));
 
-    let action = match (header, extract, disassemble) {
-        (true, _, _) => FileAction::Header,
-        (_, true, _) => FileAction::Extract,
-        (_, _, true) => FileAction::Disassemble,
+    let action = match (header, info, symbols, disassemble) {
+        (true, _, _, _) => FileAction::Header,
+        (_, true, _, _) => FileAction::Info,
+        (_, _, true, _) => FileAction::Symbols,
+        (_, _, _, true) => FileAction::Disassemble,
         _ => unreachable!(),
     };
 
