@@ -16,7 +16,7 @@ we32dis [-n <sec>] -h|-i|-s|-d <file>
    -i            Dump section information
    -t            Dump symbol table
    -d            Disassemble the named section as WE32100 source
-   &lt;file&gt;  The input file
+   <file>        The input file
 ```
 ## Building
 
