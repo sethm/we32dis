@@ -21,8 +21,8 @@ we32dis [-n <sec>] -h|-i|-s|-d <file>
 ## Building
 
 This project is written in Rust (1.31.0 at a minumim). For more
-information on Rust, see (https://www.rust-lang.org/)[The Rust Language Homepage].
-To install Rust, it is very convenient to use (https://rustup.rs/)[the rustup toolchain installer],
+information on Rust, see [The Rust Language Homepage](https://www.rust-lang.org/).
+To install Rust, it is very convenient to use [the rustup toolchain installer](https://rustup.rs/),
 however, other options are available.
 
 ## LICENSE
